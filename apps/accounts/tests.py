@@ -1,4 +1,5 @@
 from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.urls import reverse
 from types import SimpleNamespace
 from rest_framework import status
@@ -18,6 +19,16 @@ class AccountAPITests(APITestCase):
         body = schema.json()
         self.assertIn('/api/v1/reservations/', body['paths'])
         self.assertIn('bearerAuth', body['components']['securitySchemes'])
+
+        redoc = self.client.get('/api/redoc/')
+        self.assertContains(
+            redoc,
+            'https://cdn.jsdelivr.net/npm/redoc@2.1.5/bundles/redoc.standalone.js',
+        )
+        self.assertNotIn(
+            '@latest',
+            settings.SPECTACULAR_SETTINGS['REDOC_DIST'],
+        )
 
     def test_registration_always_creates_customer(self):
         response = self.client.post(
