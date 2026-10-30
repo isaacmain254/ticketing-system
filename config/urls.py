@@ -28,6 +28,11 @@ urlpatterns = [
     path('api/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('api/', include('apps.reservations.urls')),
+    path('api/v1/auth/', include('apps.accounts.urls')),
+    path('api/v1/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair_v1'),
+    path('api/v1/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh_v1'),
+    path('api/v1/', include('apps.events.urls')),
+    path('api/v1/', include('apps.reservations.urls')),
     path('api/schema/', SpectacularAPIView.as_view(), name='schema'),
     path('api/docs/', SpectacularSwaggerView.as_view(), name='swagger-ui'),
 ]

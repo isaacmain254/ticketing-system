@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import Reservation
+from .models import InventoryMovement, Reservation
 
 
 class ReservationSerializer(serializers.ModelSerializer):
@@ -30,3 +30,18 @@ class ReservationSerializer(serializers.ModelSerializer):
 class CreateReservationSerializer(serializers.Serializer):
     ticket_type = serializers.UUIDField()
     quantity = serializers.IntegerField(min_value=1)
+
+
+class InventoryMovementSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = InventoryMovement
+        fields = (
+            'id',
+            'ticket_type',
+            'reservation',
+            'movement_type',
+            'quantity',
+            'metadata',
+            'created_at',
+        )
+        read_only_fields = fields

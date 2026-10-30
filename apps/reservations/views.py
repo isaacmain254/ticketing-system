@@ -13,7 +13,11 @@ from .exceptions import (
 )
 from .models import Reservation
 from .permissions import IsReservationOwner
-from .serializers import CreateReservationSerializer, ReservationSerializer
+from .serializers import (
+    CreateReservationSerializer,
+    InventoryMovementSerializer,
+    ReservationSerializer,
+)
 from .services import cancel_reservation, confirm_reservation, create_reservation
 
 
@@ -118,3 +122,16 @@ class ReservationViewSet(
             context={'request': request},
         )
         return Response(output.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=('get',), permission_classes=(IsReservationOwner,))
+    def movements(self, request, pk=None):
+        reservation = self.get_object()
+        queryset = reservation.inventory_movements.select_related(
+            'ticket_type',
+        ).order_by('created_at', 'id')
+        serializer = InventoryMovementSerializer(
+            queryset,
+            many=True,
+            context={'request': request},
+        )
+        return Response(serializer.data)

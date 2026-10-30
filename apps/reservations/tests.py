@@ -679,3 +679,86 @@ class ReservationExpiryCommandTests(APITestCase):
         self.assertEqual(self.reservation.status, Reservation.Status.CONFIRMED)
         self.assertEqual(self.ticket_type.reserved_quantity, 0)
         self.assertEqual(self.ticket_type.sold_quantity, 3)
+
+
+class Phase6ReservationAPITests(APITestCase):
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='phase6-reservation-owner',
+            password='C0mpl3x!Passphrase',
+        )
+        self.other_customer = get_user_model().objects.create_user(
+            username='phase6-reservation-other',
+            password='C0mpl3x!Passphrase',
+        )
+        self.staff = get_user_model().objects.create_user(
+            username='phase6-reservation-staff',
+            password='C0mpl3x!Passphrase',
+            role=get_user_model().Role.STAFF,
+        )
+        event = Event.objects.create(
+            name='Phase 6 Event',
+            venue='Hall',
+            starts_at=timezone.now() + timedelta(days=10),
+            status=Event.Status.PUBLISHED,
+        )
+        self.ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('50.00'),
+            capacity=10,
+        )
+        self.reservation = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            2,
+        )
+
+    def test_versioned_reservation_create_and_confirm(self):
+        self.client.force_authenticate(self.customer)
+        created = self.client.post(
+            '/api/v1/reservations/',
+            {'ticket_type': str(self.ticket_type.id), 'quantity': 1},
+            format='json',
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED)
+
+        reservation_id = created.data['id']
+        confirmed = self.client.post(
+            f'/api/v1/reservations/{reservation_id}/confirm/'
+        )
+        self.assertEqual(confirmed.status_code, status.HTTP_200_OK)
+        self.assertEqual(confirmed.data['status'], Reservation.Status.CONFIRMED)
+
+    def test_reservation_movements_owner_staff_and_other_customer(self):
+        self.client.force_authenticate(self.customer)
+        owner = self.client.get(
+            f'/api/v1/reservations/{self.reservation.id}/movements/'
+        )
+        self.assertEqual(owner.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(owner.data), 1)
+        self.assertEqual(owner.data[0]['movement_type'], 'HOLD')
+
+        self.client.force_authenticate(self.other_customer)
+        other = self.client.get(
+            f'/api/v1/reservations/{self.reservation.id}/movements/'
+        )
+        self.assertEqual(other.status_code, status.HTTP_404_NOT_FOUND)
+
+        self.client.force_authenticate(self.staff)
+        staff = self.client.get(
+            f'/api/v1/reservations/{self.reservation.id}/movements/'
+        )
+        self.assertEqual(staff.status_code, status.HTTP_200_OK)
+
+    def test_inventory_movement_list_is_staff_only(self):
+        response = self.client.get('/api/v1/inventory-movements/')
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+        self.client.force_authenticate(self.customer)
+        response = self.client.get('/api/v1/inventory-movements/')
+        self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.client.force_authenticate(self.staff)
+        response = self.client.get('/api/v1/inventory-movements/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)

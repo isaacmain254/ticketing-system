@@ -65,6 +65,37 @@ class AccountAPITests(APITestCase):
         self.assertEqual(refresh.status_code, status.HTTP_200_OK)
         self.assertIn('access', refresh.data)
 
+    def test_versioned_auth_routes(self):
+        response = self.client.post(
+            '/api/v1/auth/register/',
+            {
+                'username': 'versioned-user',
+                'password': 'C0mpl3x!Passphrase',
+                'password_confirm': 'C0mpl3x!Passphrase',
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        obtain = self.client.post(
+            '/api/v1/auth/token/',
+            {
+                'username': 'versioned-user',
+                'password': 'C0mpl3x!Passphrase',
+            },
+            format='json',
+        )
+        self.assertEqual(obtain.status_code, status.HTTP_200_OK)
+        self.assertIn('access', obtain.data)
+
+        refresh = self.client.post(
+            '/api/v1/auth/token/refresh/',
+            {'refresh': obtain.data['refresh']},
+            format='json',
+        )
+        self.assertEqual(refresh.status_code, status.HTTP_200_OK)
+        self.assertIn('access', refresh.data)
+
     def test_is_staff_user_permission(self):
         permission = IsStaffUser()
         staff = get_user_model()(
