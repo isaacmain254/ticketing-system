@@ -3,6 +3,7 @@ from datetime import timedelta
 import threading
 
 import io
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
@@ -262,6 +263,20 @@ class ReservationCreationServiceTests(APITestCase):
         self.assertFalse(Reservation.objects.exists())
         self.assertFalse(InventoryMovement.objects.exists())
 
+    def test_ledger_failure_rolls_back_reservation_and_inventory(self):
+        with patch.object(
+            InventoryMovement.objects,
+            'create',
+            side_effect=RuntimeError('forced ledger failure'),
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'forced ledger failure'):
+                create_reservation(self.customer, self.ticket_type.id, 3)
+
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertFalse(Reservation.objects.exists())
+        self.assertFalse(InventoryMovement.objects.exists())
+
     def test_invalid_quantity_is_rejected(self):
         for quantity in (0, -1, True, 1.5):
             with self.subTest(quantity=quantity):
@@ -396,6 +411,154 @@ class ReservationCreationConcurrencyTests(TransactionTestCase):
         self.ticket_type.refresh_from_db()
         self.assertEqual(self.ticket_type.reserved_quantity, 1)
 
+    def test_one_hundred_requests_cannot_reserve_beyond_five_tickets(self):
+        self.ticket_type.capacity = 5
+        self.ticket_type.save(update_fields=('capacity',))
+        customers = [
+            get_user_model().objects.create_user(
+                username=f'concurrent-proof-{index}',
+                password='C0mpl3x!Passphrase',
+            )
+            for index in range(100)
+        ]
+        barrier = threading.Barrier(100)
+        results = []
+        errors = []
+        result_lock = threading.Lock()
+
+        def reserve(customer):
+            close_old_connections()
+            try:
+                barrier.wait(timeout=20)
+                create_reservation(customer, self.ticket_type.id, 1)
+                with result_lock:
+                    results.append('success')
+            except InsufficientInventory:
+                with result_lock:
+                    results.append('insufficient')
+            except Exception as exc:
+                with result_lock:
+                    errors.append(exc)
+            finally:
+                close_old_connections()
+
+        threads = [
+            threading.Thread(target=reserve, args=(customer,))
+            for customer in customers
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results.count('success'), 5)
+        self.assertEqual(results.count('insufficient'), 95)
+
+        self.ticket_type.refresh_from_db()
+        successful_reservations = Reservation.objects.filter(
+            ticket_type=self.ticket_type,
+            status=Reservation.Status.PENDING,
+        )
+        held_quantity = sum(
+            reservation.quantity for reservation in successful_reservations
+        )
+        movement_quantity = sum(
+            movement.quantity
+            for movement in InventoryMovement.objects.filter(
+                ticket_type=self.ticket_type,
+                movement_type=InventoryMovement.MovementType.HOLD,
+            )
+        )
+        self.assertEqual(successful_reservations.count(), 5)
+        self.assertEqual(held_quantity, 5)
+        self.assertEqual(self.ticket_type.reserved_quantity, held_quantity)
+        self.assertEqual(
+            self.ticket_type.reserved_quantity + self.ticket_type.sold_quantity,
+            5,
+        )
+        self.assertLessEqual(
+            self.ticket_type.reserved_quantity + self.ticket_type.sold_quantity,
+            self.ticket_type.capacity,
+        )
+        self.assertEqual(movement_quantity, held_quantity)
+
+
+class ReservationTransitionConcurrencyTests(TransactionTestCase):
+    reset_sequences = True
+
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='transition-race-customer',
+            password='C0mpl3x!Passphrase',
+        )
+        event = Event.objects.create(
+            name='Transition Race Event',
+            venue='Arena',
+            starts_at=timezone.now() + timedelta(days=1),
+            status=Event.Status.PUBLISHED,
+        )
+        self.ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('60.00'),
+            capacity=10,
+        )
+        self.reservation = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            3,
+        )
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+
+    def test_competing_confirmation_and_expiry_leave_one_terminal_state(self):
+        barrier = threading.Barrier(2)
+        errors = []
+
+        def confirm():
+            close_old_connections()
+            try:
+                barrier.wait(timeout=10)
+                confirm_reservation(self.customer, self.reservation.id)
+            except InvalidReservationTransition:
+                pass
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        def expire():
+            close_old_connections()
+            try:
+                barrier.wait(timeout=10)
+                expire_reservation(self.reservation.id)
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                close_old_connections()
+
+        confirm_thread = threading.Thread(target=confirm)
+        expire_thread = threading.Thread(target=expire)
+        confirm_thread.start()
+        expire_thread.start()
+        confirm_thread.join(timeout=20)
+        expire_thread.join(timeout=20)
+
+        self.assertEqual(errors, [])
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.EXPIRED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 0)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.RELEASE,
+            ).count(),
+            1,
+        )
+
 
 class ReservationTransitionTests(APITestCase):
     def setUp(self):
@@ -463,6 +626,31 @@ class ReservationTransitionTests(APITestCase):
                 movement_type=InventoryMovement.MovementType.SALE,
             ).count(),
             1,
+        )
+
+    def test_confirmation_ledger_failure_rolls_back_counters_and_status(self):
+        with patch.object(
+            InventoryMovement.objects,
+            'create',
+            side_effect=RuntimeError('forced confirmation ledger failure'),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                'forced confirmation ledger failure',
+            ):
+                confirm_reservation(self.customer, self.reservation.id)
+
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.PENDING)
+        self.assertIsNone(self.reservation.confirmed_at)
+        self.assertEqual(self.ticket_type.reserved_quantity, 3)
+        self.assertEqual(self.ticket_type.sold_quantity, 0)
+        self.assertFalse(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.SALE,
+            ).exists()
         )
 
     def test_cancellation_releases_inventory_and_creates_release(self):
@@ -679,7 +867,6 @@ class ReservationExpiryCommandTests(APITestCase):
         self.assertEqual(self.reservation.status, Reservation.Status.CONFIRMED)
         self.assertEqual(self.ticket_type.reserved_quantity, 0)
         self.assertEqual(self.ticket_type.sold_quantity, 3)
-
 
 class Phase6ReservationAPITests(APITestCase):
     def setUp(self):
