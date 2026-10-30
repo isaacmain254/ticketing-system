@@ -82,6 +82,39 @@ def _lock_reservation_and_ticket_type(reservation_id):
     return reservation, ticket_type
 
 
+def _expire_locked(reservation, ticket_type, now, reason):
+    if reservation.status != Reservation.Status.PENDING:
+        return False
+    if reservation.expires_at > now:
+        return False
+
+    reservation.status = Reservation.Status.EXPIRED
+    reservation.confirmed_at = None
+    reservation.save(update_fields=('status', 'confirmed_at', 'updated_at'))
+
+    ticket_type.reserved_quantity -= reservation.quantity
+    ticket_type.save(update_fields=('reserved_quantity', 'updated_at'))
+    InventoryMovement.objects.create(
+        ticket_type=ticket_type,
+        reservation=reservation,
+        movement_type=InventoryMovement.MovementType.RELEASE,
+        quantity=reservation.quantity,
+        metadata={'reason': reason},
+    )
+    return True
+
+
+@transaction.atomic
+def expire_reservation(reservation_id, now=None):
+    reservation, ticket_type = _lock_reservation_and_ticket_type(reservation_id)
+    return _expire_locked(
+        reservation,
+        ticket_type,
+        now or timezone.now(),
+        'expired_by_worker',
+    )
+
+
 @transaction.atomic
 def confirm_reservation(customer, reservation_id):
     reservation, ticket_type = _lock_reservation_and_ticket_type(reservation_id)
@@ -97,18 +130,11 @@ def confirm_reservation(customer, reservation_id):
 
     now = timezone.now()
     if reservation.expires_at <= now:
-        reservation.status = Reservation.Status.EXPIRED
-        reservation.confirmed_at = None
-        reservation.save(update_fields=('status', 'confirmed_at', 'updated_at'))
-
-        ticket_type.reserved_quantity -= reservation.quantity
-        ticket_type.save(update_fields=('reserved_quantity', 'updated_at'))
-        InventoryMovement.objects.create(
-            ticket_type=ticket_type,
-            reservation=reservation,
-            movement_type=InventoryMovement.MovementType.RELEASE,
-            quantity=reservation.quantity,
-            metadata={'reason': 'expired_during_confirmation'},
+        _expire_locked(
+            reservation,
+            ticket_type,
+            now,
+            'expired_during_confirmation',
         )
         reservation.was_expired_during_confirmation = True
         return reservation

@@ -2,7 +2,11 @@ from decimal import Decimal
 from datetime import timedelta
 import threading
 
+import io
+
 from django.contrib.auth import get_user_model
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db import close_old_connections
@@ -20,7 +24,12 @@ from .exceptions import (
     TicketTypeNotAvailable,
 )
 from .models import InventoryMovement, Reservation
-from .services import cancel_reservation, confirm_reservation, create_reservation
+from .services import (
+    cancel_reservation,
+    confirm_reservation,
+    create_reservation,
+    expire_reservation,
+)
 
 
 class ReservationModelTests(TestCase):
@@ -574,3 +583,99 @@ class ReservationTransitionTests(APITestCase):
         )
 
         self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+
+
+class ReservationExpiryCommandTests(APITestCase):
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='expiry-owner',
+            password='C0mpl3x!Passphrase',
+        )
+        event = Event.objects.create(
+            name='Expiry Event',
+            venue='Arena',
+            starts_at=timezone.now() + timedelta(days=1),
+            status=Event.Status.PUBLISHED,
+        )
+        self.ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('40.00'),
+            capacity=10,
+        )
+        self.reservation = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            3,
+        )
+
+    def run_expiry_command(self, *args):
+        output = io.StringIO()
+        call_command('expire_reservations', *args, stdout=output)
+        return output.getvalue()
+
+    def test_command_expires_past_deadline_and_releases_once(self):
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+
+        self.run_expiry_command()
+        self.run_expiry_command()
+
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.EXPIRED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.RELEASE,
+            ).count(),
+            1,
+        )
+
+    def test_command_does_not_expire_future_deadline(self):
+        output = self.run_expiry_command()
+
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.PENDING)
+        self.assertEqual(self.ticket_type.reserved_quantity, 3)
+        self.assertIn('Expired 0 reservation(s).', output)
+
+    def test_batch_size_limits_processed_reservations(self):
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+        second = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            1,
+        )
+        second.expires_at = timezone.now() - timedelta(seconds=2)
+        second.save(update_fields=('expires_at',))
+
+        output = self.run_expiry_command('--batch-size', '1')
+
+        self.assertIn('Expired 1 reservation(s).', output)
+        expired_count = Reservation.objects.filter(
+            status=Reservation.Status.EXPIRED
+        ).count()
+        self.assertEqual(expired_count, 1)
+
+    def test_negative_batch_size_is_rejected(self):
+        with self.assertRaises(CommandError):
+            self.run_expiry_command('--batch-size', '-1')
+
+    def test_confirmation_wins_race(self):
+        confirmed = confirm_reservation(
+            self.customer,
+            self.reservation.id,
+        )
+        expired = expire_reservation(self.reservation.id)
+
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(confirmed.status, Reservation.Status.CONFIRMED)
+        self.assertFalse(expired)
+        self.assertEqual(self.reservation.status, Reservation.Status.CONFIRMED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 3)
