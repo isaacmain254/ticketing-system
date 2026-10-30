@@ -736,8 +736,8 @@ class Phase6ReservationAPITests(APITestCase):
             f'/api/v1/reservations/{self.reservation.id}/movements/'
         )
         self.assertEqual(owner.status_code, status.HTTP_200_OK)
-        self.assertEqual(len(owner.data), 1)
-        self.assertEqual(owner.data[0]['movement_type'], 'HOLD')
+        self.assertEqual(owner.data['count'], 1)
+        self.assertEqual(owner.data['results'][0]['movement_type'], 'HOLD')
 
         self.client.force_authenticate(self.other_customer)
         other = self.client.get(
@@ -762,3 +762,136 @@ class Phase6ReservationAPITests(APITestCase):
         self.client.force_authenticate(self.staff)
         response = self.client.get('/api/v1/inventory-movements/')
         self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+
+class Phase7ReservationFilterTests(APITestCase):
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='phase7-customer',
+            password='C0mpl3x!Passphrase',
+        )
+        self.other_customer = get_user_model().objects.create_user(
+            username='phase7-other',
+            password='C0mpl3x!Passphrase',
+        )
+        self.staff = get_user_model().objects.create_user(
+            username='phase7-staff',
+            password='C0mpl3x!Passphrase',
+            role=get_user_model().Role.STAFF,
+        )
+        event = Event.objects.create(
+            name='Phase 7 Event',
+            venue='Hall',
+            starts_at=timezone.now() + timedelta(days=20),
+            status=Event.Status.PUBLISHED,
+        )
+        self.ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('30.00'),
+            capacity=20,
+        )
+        self.reservation = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            2,
+        )
+        self.other_reservation = create_reservation(
+            self.other_customer,
+            self.ticket_type.id,
+            1,
+        )
+
+    def test_combined_reservation_filters(self):
+        self.client.force_authenticate(self.customer)
+        created_after = (
+            timezone.now() - timedelta(minutes=1)
+        ).isoformat()
+        response = self.client.get(
+            '/api/v1/reservations/',
+            {
+                'status': 'pending',
+                'ticket_type': str(self.ticket_type.id),
+                'event_id': str(self.ticket_type.event_id),
+                'created_after': created_after,
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(response.data['results'][0]['id'], str(self.reservation.id))
+
+    def test_customer_cannot_filter_to_other_customer(self):
+        self.client.force_authenticate(self.customer)
+        response = self.client.get(
+            '/api/v1/reservations/',
+            {'customer_id': self.other_customer.id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(
+            response.data['results'][0]['id'],
+            str(self.reservation.id),
+        )
+
+    def test_staff_can_filter_by_customer(self):
+        self.client.force_authenticate(self.staff)
+        response = self.client.get(
+            '/api/v1/reservations/',
+            {'customer_id': self.other_customer.id},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['count'], 1)
+        self.assertEqual(
+            response.data['results'][0]['id'],
+            str(self.other_reservation.id),
+        )
+
+    def test_reversed_date_range_returns_400(self):
+        self.client.force_authenticate(self.customer)
+        now = timezone.now()
+        response = self.client.get(
+            '/api/v1/reservations/',
+            {
+                'created_after': (now + timedelta(days=1)).isoformat(),
+                'created_before': now.isoformat(),
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_invalid_status_uuid_and_ordering_return_400(self):
+        self.client.force_authenticate(self.customer)
+
+        status_response = self.client.get(
+            '/api/v1/reservations/',
+            {'status': 'unknown'},
+        )
+        uuid_response = self.client.get(
+            '/api/v1/reservations/',
+            {'ticket_type': 'not-a-uuid'},
+        )
+        ordering_response = self.client.get(
+            '/api/v1/reservations/',
+            {'ordering': 'customer_id'},
+        )
+
+        self.assertEqual(status_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(uuid_response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(ordering_response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_page_size_is_capped_and_metadata_is_present(self):
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get(
+            '/api/v1/reservations/',
+            {'page_size': 500},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertIn('count', response.data)
+        self.assertIn('next', response.data)
+        self.assertIn('previous', response.data)
+        self.assertIn('results', response.data)

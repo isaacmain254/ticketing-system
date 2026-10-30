@@ -2,6 +2,10 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
+from django_filters.rest_framework import DjangoFilterBackend
+
+from .backends import StableOrderingFilter
+from .filters import ReservationFilterSet
 
 from .exceptions import (
     InsufficientInventory,
@@ -29,6 +33,9 @@ class ReservationViewSet(
 ):
     serializer_class = ReservationSerializer
     permission_classes = (IsReservationOwner,)
+    filter_backends = (DjangoFilterBackend, StableOrderingFilter)
+    filterset_class = ReservationFilterSet
+    ordering_fields = ('created_at', 'expires_at', 'status')
 
     def get_queryset(self):
         queryset = Reservation.objects.select_related(
@@ -129,9 +136,12 @@ class ReservationViewSet(
         queryset = reservation.inventory_movements.select_related(
             'ticket_type',
         ).order_by('created_at', 'id')
+        page = self.paginate_queryset(queryset)
         serializer = InventoryMovementSerializer(
-            queryset,
+            page if page is not None else queryset,
             many=True,
             context={'request': request},
         )
+        if page is not None:
+            return self.get_paginated_response(serializer.data)
         return Response(serializer.data)

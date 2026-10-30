@@ -2,9 +2,12 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from django_filters.rest_framework import DjangoFilterBackend
 
 from apps.accounts.permissions import IsStaffUser
 from apps.reservations.models import InventoryMovement
+from apps.reservations.filters import InventoryMovementFilterSet
+from apps.reservations.backends import StableOrderingFilter
 from apps.reservations.serializers import InventoryMovementSerializer
 from .models import Event, TicketType
 from .serializers import (
@@ -95,3 +98,6 @@ class InventoryMovementViewSet(
     )
     serializer_class = InventoryMovementSerializer
     permission_classes = (IsStaffUser,)
+    filter_backends = (DjangoFilterBackend, StableOrderingFilter)
+    filterset_class = InventoryMovementFilterSet
+    ordering_fields = ('created_at', 'movement_type')
