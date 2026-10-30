@@ -12,3 +12,15 @@ class TicketTypeNotAvailable(ReservationDomainError):
 
 class InsufficientInventory(ReservationDomainError):
     pass
+
+
+class ReservationNotFound(ReservationDomainError):
+    pass
+
+
+class ReservationOwnershipDenied(ReservationDomainError):
+    pass
+
+
+class InvalidReservationTransition(ReservationDomainError):
+    pass

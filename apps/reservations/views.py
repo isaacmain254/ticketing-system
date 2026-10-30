@@ -1,16 +1,20 @@
 from rest_framework import mixins, status, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 
 from .exceptions import (
     InsufficientInventory,
     InvalidReservationQuantity,
+    InvalidReservationTransition,
+    ReservationNotFound,
+    ReservationOwnershipDenied,
     TicketTypeNotAvailable,
 )
 from .models import Reservation
 from .permissions import IsReservationOwner
 from .serializers import CreateReservationSerializer, ReservationSerializer
-from .services import create_reservation
+from .services import cancel_reservation, confirm_reservation, create_reservation
 
 
 class ReservationViewSet(
@@ -63,3 +67,54 @@ class ReservationViewSet(
             context={'request': request},
         )
         return Response(output.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=('post',), permission_classes=(IsReservationOwner,))
+    def confirm(self, request, pk=None):
+        try:
+            reservation = confirm_reservation(
+                customer=request.user,
+                reservation_id=pk,
+            )
+        except ReservationOwnershipDenied:
+            raise NotFound('Reservation not found.')
+        except ReservationNotFound as exc:
+            raise NotFound(str(exc))
+        except InvalidReservationTransition as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        output = ReservationSerializer(
+            reservation,
+            context={'request': request},
+        )
+        if reservation.status == Reservation.Status.EXPIRED:
+            return Response(
+                output.data,
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(output.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=('post',), permission_classes=(IsReservationOwner,))
+    def cancel(self, request, pk=None):
+        try:
+            reservation = cancel_reservation(
+                customer=request.user,
+                reservation_id=pk,
+            )
+        except ReservationOwnershipDenied:
+            raise NotFound('Reservation not found.')
+        except ReservationNotFound as exc:
+            raise NotFound(str(exc))
+        except InvalidReservationTransition as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        output = ReservationSerializer(
+            reservation,
+            context={'request': request},
+        )
+        return Response(output.data, status=status.HTTP_200_OK)

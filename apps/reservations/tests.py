@@ -12,9 +12,15 @@ from rest_framework import status
 from rest_framework.test import APITestCase
 
 from apps.events.models import Event, TicketType
-from .exceptions import InsufficientInventory, InvalidReservationQuantity, TicketTypeNotAvailable
+from .exceptions import (
+    InsufficientInventory,
+    InvalidReservationQuantity,
+    InvalidReservationTransition,
+    ReservationOwnershipDenied,
+    TicketTypeNotAvailable,
+)
 from .models import InventoryMovement, Reservation
-from .services import create_reservation
+from .services import cancel_reservation, confirm_reservation, create_reservation
 
 
 class ReservationModelTests(TestCase):
@@ -231,7 +237,10 @@ class ReservationCreationServiceTests(APITestCase):
             InventoryMovement.objects.filter(reservation=reservation).count(),
             1,
         )
-        movement = InventoryMovement.objects.get(reservation=reservation)
+        movement = InventoryMovement.objects.get(
+            reservation=reservation,
+            movement_type=InventoryMovement.MovementType.HOLD,
+        )
         self.assertEqual(movement.movement_type, InventoryMovement.MovementType.HOLD)
         self.assertEqual(movement.quantity, 3)
 
@@ -377,3 +386,191 @@ class ReservationCreationConcurrencyTests(TransactionTestCase):
         )
         self.ticket_type.refresh_from_db()
         self.assertEqual(self.ticket_type.reserved_quantity, 1)
+
+
+class ReservationTransitionTests(APITestCase):
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='transition-owner',
+            password='C0mpl3x!Passphrase',
+        )
+        self.other_customer = get_user_model().objects.create_user(
+            username='transition-other',
+            password='C0mpl3x!Passphrase',
+        )
+        self.staff = get_user_model().objects.create_user(
+            username='transition-staff',
+            password='C0mpl3x!Passphrase',
+            role=get_user_model().Role.STAFF,
+        )
+        event = Event.objects.create(
+            name='Transition Event',
+            venue='Arena',
+            starts_at=timezone.now() + timedelta(days=1),
+            status=Event.Status.PUBLISHED,
+        )
+        self.ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('60.00'),
+            capacity=10,
+        )
+        self.reservation = create_reservation(
+            self.customer,
+            self.ticket_type.id,
+            3,
+        )
+
+    def test_confirmation_moves_inventory_and_creates_sale(self):
+        reservation = confirm_reservation(
+            self.customer,
+            self.reservation.id,
+        )
+
+        self.ticket_type.refresh_from_db()
+        self.reservation.refresh_from_db()
+        reservation.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
+        self.assertIsNotNone(reservation.confirmed_at)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 3)
+        movement = InventoryMovement.objects.get(
+            reservation=reservation,
+            movement_type=InventoryMovement.MovementType.SALE,
+        )
+        self.assertEqual(movement.movement_type, InventoryMovement.MovementType.SALE)
+        self.assertEqual(movement.quantity, 3)
+
+    def test_repeated_confirmation_is_idempotent(self):
+        confirm_reservation(self.customer, self.reservation.id)
+        confirm_reservation(self.customer, self.reservation.id)
+
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 3)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.SALE,
+            ).count(),
+            1,
+        )
+
+    def test_cancellation_releases_inventory_and_creates_release(self):
+        reservation = cancel_reservation(
+            self.customer,
+            self.reservation.id,
+        )
+
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.CANCELLED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 0)
+        movement = InventoryMovement.objects.filter(
+            reservation=reservation,
+            movement_type=InventoryMovement.MovementType.RELEASE,
+        ).get()
+        self.assertEqual(movement.quantity, 3)
+
+    def test_repeated_cancellation_is_idempotent(self):
+        cancel_reservation(self.customer, self.reservation.id)
+        cancel_reservation(self.customer, self.reservation.id)
+
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.RELEASE,
+            ).count(),
+            1,
+        )
+
+    def test_confirmation_after_deadline_expires_and_releases_hold(self):
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+
+        reservation = confirm_reservation(
+            self.customer,
+            self.reservation.id,
+        )
+
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(reservation.status, Reservation.Status.EXPIRED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(self.ticket_type.sold_quantity, 0)
+        movement = InventoryMovement.objects.get(
+            reservation=self.reservation,
+            movement_type=InventoryMovement.MovementType.RELEASE,
+        )
+        self.assertEqual(movement.quantity, 3)
+
+    def test_confirming_expired_reservation_is_rejected(self):
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+        confirm_reservation(self.customer, self.reservation.id)
+
+        with self.assertRaises(InvalidReservationTransition):
+            confirm_reservation(self.customer, self.reservation.id)
+
+    def test_confirmed_reservation_cannot_be_cancelled(self):
+        confirm_reservation(self.customer, self.reservation.id)
+
+        with self.assertRaises(InvalidReservationTransition):
+            cancel_reservation(self.customer, self.reservation.id)
+
+    def test_other_customer_cannot_transition_reservation(self):
+        with self.assertRaises(ReservationOwnershipDenied):
+            confirm_reservation(
+                self.other_customer,
+                self.reservation.id,
+            )
+
+        self.reservation.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.PENDING)
+
+    def test_confirm_api_returns_conflict_for_past_deadline(self):
+        self.reservation.expires_at = timezone.now() - timedelta(seconds=1)
+        self.reservation.save(update_fields=('expires_at',))
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.post(
+            f'/api/reservations/{self.reservation.id}/confirm/'
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.reservation.refresh_from_db()
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.reservation.status, Reservation.Status.EXPIRED)
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+
+    def test_cancel_api_is_idempotent(self):
+        self.client.force_authenticate(self.customer)
+
+        first = self.client.post(
+            f'/api/reservations/{self.reservation.id}/cancel/'
+        )
+        second = self.client.post(
+            f'/api/reservations/{self.reservation.id}/cancel/'
+        )
+
+        self.assertEqual(first.status_code, status.HTTP_200_OK)
+        self.assertEqual(second.status_code, status.HTTP_200_OK)
+        self.ticket_type.refresh_from_db()
+        self.assertEqual(self.ticket_type.reserved_quantity, 0)
+        self.assertEqual(
+            InventoryMovement.objects.filter(
+                reservation=self.reservation,
+                movement_type=InventoryMovement.MovementType.RELEASE,
+            ).count(),
+            1,
+        )
+
+    def test_staff_may_transition_reservation(self):
+        reservation = confirm_reservation(
+            self.staff,
+            self.reservation.id,
+        )
+
+        self.assertEqual(reservation.status, Reservation.Status.CONFIRMED)
