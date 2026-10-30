@@ -172,7 +172,26 @@ SIMPLE_JWT = {
 
 SPECTACULAR_SETTINGS = {
     'TITLE': 'Ticketing Inventory Reservation API',
-    'DESCRIPTION': 'API for managing events, ticket inventory, and reservations.',
+    'DESCRIPTION': (
+        'Atomic ticket inventory API. A pending reservation temporarily holds '
+        'inventory for ten minutes. Confirmation converts the hold to a sale; '
+        'cancellation or expiry releases it. PostgreSQL row locks serialize '
+        'reservation transitions and prevent overselling.'
+    ),
     'VERSION': '1.0.0',
     'SERVE_INCLUDE_SCHEMA': False,
+    'COMPONENT_SPLIT_REQUEST': True,
+    'SECURITY': [{'bearerAuth': []}],
+    'APPEND_COMPONENTS': {
+        'securitySchemes': {
+            'bearerAuth': {
+                'type': 'http',
+                'scheme': 'bearer',
+                'bearerFormat': 'JWT',
+            },
+        },
+    },
+    'SWAGGER_UI_SETTINGS': {
+        'persistAuthorization': True,
+    },
 }

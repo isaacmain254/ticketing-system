@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import OpenApiExample, OpenApiResponse, extend_schema
 
 from .backends import StableOrderingFilter
 from .filters import ReservationFilterSet
@@ -32,12 +33,19 @@ class ReservationViewSet(
     viewsets.GenericViewSet,
 ):
     serializer_class = ReservationSerializer
+    queryset = Reservation.objects.select_related(
+        'customer',
+        'ticket_type',
+        'ticket_type__event',
+    )
     permission_classes = (IsReservationOwner,)
     filter_backends = (DjangoFilterBackend, StableOrderingFilter)
     filterset_class = ReservationFilterSet
     ordering_fields = ('created_at', 'expires_at', 'status')
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Reservation.objects.none()
         queryset = Reservation.objects.select_related(
             'customer',
             'ticket_type',
@@ -53,6 +61,26 @@ class ReservationViewSet(
             return CreateReservationSerializer
         return ReservationSerializer
 
+    @extend_schema(
+        summary='Create a reservation',
+        description='Atomically holds inventory for a published ticket type.',
+        request=CreateReservationSerializer,
+        responses={
+            201: ReservationSerializer,
+            400: OpenApiResponse(description='Malformed or invalid input'),
+            409: OpenApiResponse(description='Insufficient inventory'),
+        },
+        examples=[
+            OpenApiExample(
+                'Create reservation',
+                value={
+                    'ticket_type': '00000000-0000-0000-0000-000000000001',
+                    'quantity': 2,
+                },
+                request_only=True,
+            )
+        ],
+    )
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -79,6 +107,14 @@ class ReservationViewSet(
         )
         return Response(output.data, status=status.HTTP_201_CREATED)
 
+    @extend_schema(
+        summary='Confirm a reservation',
+        description='Convert a valid pending hold into a confirmed sale. Past deadlines expire atomically.',
+        responses={
+            200: ReservationSerializer,
+            409: ReservationSerializer,
+        },
+    )
     @action(detail=True, methods=('post',), permission_classes=(IsReservationOwner,))
     def confirm(self, request, pk=None):
         try:
@@ -107,6 +143,11 @@ class ReservationViewSet(
             )
         return Response(output.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        summary='Cancel a reservation',
+        description='Release a pending hold and create one release movement. Repeated cancellation is idempotent.',
+        responses={200: ReservationSerializer, 409: OpenApiResponse(description='Invalid transition')},
+    )
     @action(detail=True, methods=('post',), permission_classes=(IsReservationOwner,))
     def cancel(self, request, pk=None):
         try:
@@ -130,6 +171,10 @@ class ReservationViewSet(
         )
         return Response(output.data, status=status.HTTP_200_OK)
 
+    @extend_schema(
+        summary='List reservation movements',
+        responses={200: InventoryMovementSerializer(many=True)},
+    )
     @action(detail=True, methods=('get',), permission_classes=(IsReservationOwner,))
     def movements(self, request, pk=None):
         reservation = self.get_object()

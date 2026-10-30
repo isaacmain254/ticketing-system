@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from django_filters.rest_framework import DjangoFilterBackend
+from drf_spectacular.utils import extend_schema
 
 from apps.accounts.permissions import IsStaffUser
 from apps.reservations.models import InventoryMovement
@@ -26,8 +27,11 @@ class EventViewSet(
     viewsets.GenericViewSet,
 ):
     serializer_class = EventSerializer
+    queryset = Event.objects.all()
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return Event.objects.none()
         queryset = Event.objects.all()
         if self.action in ('list', 'retrieve'):
             return queryset.filter(status=Event.Status.PUBLISHED)
@@ -38,6 +42,11 @@ class EventViewSet(
             return (IsStaffUser(),)
         return (AllowAny(),)
 
+    @extend_schema(
+        summary='Create a ticket type for an event',
+        request=CreateTicketTypeSerializer,
+        responses={201: TicketTypeSerializer},
+    )
     @action(
         detail=True,
         methods=('post',),
@@ -67,6 +76,8 @@ class TicketTypeViewSet(
     serializer_class = TicketTypeSerializer
 
     def get_queryset(self):
+        if getattr(self, 'swagger_fake_view', False):
+            return TicketType.objects.none()
         if self.action == 'inventory':
             return TicketType.objects.select_related('event')
         return TicketType.objects.select_related('event').filter(

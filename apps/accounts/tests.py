@@ -8,6 +8,17 @@ from .permissions import IsStaffUser
 
 
 class AccountAPITests(APITestCase):
+    def test_schema_and_interactive_documentation_routes(self):
+        for path in ('/api/schema/', '/api/docs/', '/api/redoc/'):
+            response = self.client.get(path)
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        schema = self.client.get('/api/schema/', {'format': 'json'})
+        self.assertEqual(schema.status_code, status.HTTP_200_OK)
+        body = schema.json()
+        self.assertIn('/api/v1/reservations/', body['paths'])
+        self.assertIn('bearerAuth', body['components']['securitySchemes'])
+
     def test_registration_always_creates_customer(self):
         response = self.client.post(
             '/api/auth/register/',
