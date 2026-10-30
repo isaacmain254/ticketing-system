@@ -1,11 +1,24 @@
-from rest_framework import viewsets
+from rest_framework import mixins, status, viewsets
+from rest_framework.exceptions import NotFound, ValidationError
+from rest_framework.response import Response
 
+from .exceptions import (
+    InsufficientInventory,
+    InvalidReservationQuantity,
+    TicketTypeNotAvailable,
+)
 from .models import Reservation
 from .permissions import IsReservationOwner
-from .serializers import ReservationSerializer
+from .serializers import CreateReservationSerializer, ReservationSerializer
+from .services import create_reservation
 
 
-class ReservationViewSet(viewsets.ReadOnlyModelViewSet):
+class ReservationViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
     serializer_class = ReservationSerializer
     permission_classes = (IsReservationOwner,)
 
@@ -19,3 +32,34 @@ class ReservationViewSet(viewsets.ReadOnlyModelViewSet):
         if getattr(user, 'role', None) == 'STAFF':
             return queryset
         return queryset.filter(customer=user)
+
+    def get_serializer_class(self):
+        if self.action == 'create':
+            return CreateReservationSerializer
+        return ReservationSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            reservation = create_reservation(
+                customer=request.user,
+                ticket_type_id=serializer.validated_data['ticket_type'],
+                quantity=serializer.validated_data['quantity'],
+            )
+        except InvalidReservationQuantity as exc:
+            raise ValidationError({'quantity': str(exc)})
+        except TicketTypeNotAvailable as exc:
+            raise NotFound(str(exc))
+        except InsufficientInventory as exc:
+            return Response(
+                {'detail': str(exc)},
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        output = ReservationSerializer(
+            reservation,
+            context={'request': request},
+        )
+        return Response(output.data, status=status.HTTP_201_CREATED)

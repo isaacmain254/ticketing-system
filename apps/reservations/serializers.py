@@ -25,3 +25,8 @@ class ReservationSerializer(serializers.ModelSerializer):
             'updated_at',
         )
         read_only_fields = fields
+
+
+class CreateReservationSerializer(serializers.Serializer):
+    ticket_type = serializers.UUIDField()
+    quantity = serializers.IntegerField(min_value=1)
