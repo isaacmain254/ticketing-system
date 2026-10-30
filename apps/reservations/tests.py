@@ -6,6 +6,8 @@ from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.test import TestCase
 from django.utils import timezone
+from rest_framework import status
+from rest_framework.test import APITestCase
 
 from apps.events.models import Event, TicketType
 from .models import InventoryMovement, Reservation
@@ -94,3 +96,97 @@ class ReservationModelTests(TestCase):
 
         with self.assertRaises(IntegrityError), transaction.atomic():
             reservation.delete()
+
+
+class ReservationOwnershipAPITests(APITestCase):
+    def setUp(self):
+        self.customer = get_user_model().objects.create_user(
+            username='customer-one',
+            password='C0mpl3x!Passphrase',
+        )
+        self.other_customer = get_user_model().objects.create_user(
+            username='customer-two',
+            password='C0mpl3x!Passphrase',
+        )
+        self.staff = get_user_model().objects.create_user(
+            username='staff-one',
+            password='C0mpl3x!Passphrase',
+            role=get_user_model().Role.STAFF,
+        )
+        event = Event.objects.create(
+            name='Ownership Event',
+            venue='Main Hall',
+            starts_at=timezone.now() + timedelta(days=1),
+            status=Event.Status.PUBLISHED,
+        )
+        ticket_type = TicketType.objects.create(
+            event=event,
+            name='General',
+            price=Decimal('40.00'),
+            capacity=50,
+        )
+        self.reservation = Reservation.objects.create(
+            customer=self.customer,
+            ticket_type=ticket_type,
+            quantity=2,
+            unit_price=ticket_type.price,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+
+    def test_anonymous_cannot_list_reservations(self):
+        response = self.client.get('/api/reservations/')
+
+        self.assertEqual(response.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_customer_list_is_scoped_to_owner(self):
+        Reservation.objects.create(
+            customer=self.other_customer,
+            ticket_type=self.reservation.ticket_type,
+            quantity=1,
+            unit_price=self.reservation.unit_price,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get('/api/reservations/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 1)
+        self.assertEqual(response.data['results'][0]['id'], str(self.reservation.id))
+
+    def test_customer_cannot_retrieve_another_customer_reservation(self):
+        other_reservation = Reservation.objects.create(
+            customer=self.other_customer,
+            ticket_type=self.reservation.ticket_type,
+            quantity=1,
+            unit_price=self.reservation.unit_price,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get(f'/api/reservations/{other_reservation.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_customer_can_retrieve_owned_reservation(self):
+        self.client.force_authenticate(self.customer)
+
+        response = self.client.get(f'/api/reservations/{self.reservation.id}/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data['id'], str(self.reservation.id))
+
+    def test_staff_can_list_all_reservations(self):
+        Reservation.objects.create(
+            customer=self.other_customer,
+            ticket_type=self.reservation.ticket_type,
+            quantity=1,
+            unit_price=self.reservation.unit_price,
+            expires_at=timezone.now() + timedelta(minutes=10),
+        )
+        self.client.force_authenticate(self.staff)
+
+        response = self.client.get('/api/reservations/')
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data['results']), 2)
