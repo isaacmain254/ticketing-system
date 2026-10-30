@@ -28,8 +28,12 @@ staticfiles/
 # IDE and editor files
 .vscode/
 .idea/
+.commandcode/
 *.swp
 *.swo
+
+# Project planning documents
+PROJECT_PLAN.md
 
 # Operating system files
 .DS_Store
